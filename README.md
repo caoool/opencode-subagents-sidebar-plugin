@@ -4,9 +4,15 @@ An OpenCode 1.17.15+ TUI-only plugin that adds a **Subagents** section to the
 sidebar footer. It shows pending and running task subagents for the current
 parent session (or when viewing one of its child sessions).
 
-Each subagent uses a compact two-line card: status and role with its model,
-then its newest meaningful activity with elapsed runtime. Completed tasks are
-hidden.
+Each subagent uses a compact two-line card: its role with model and raw
+effort/reasoning variant, then its assigned task description with a
+right-aligned elapsed runtime. Cards intentionally do not show status glyphs
+or live transcript/activity text. Click anywhere on a card to open a live
+details popup with status, foreground/background mode, child session ID, and
+model details. The popup's **Open Session** action is available once the child
+session exists (unless it is already open); **Close** dismisses the popup.
+Completed tasks are hidden unless OpenCode still reports their background child
+session as active.
 
 ## Install
 

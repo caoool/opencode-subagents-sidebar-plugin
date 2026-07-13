@@ -2,124 +2,198 @@
 
 import type { TuiPlugin, TuiPluginApi, TuiPluginModule } from "@opencode-ai/plugin/tui"
 import type { Message, Part, Session } from "@opencode-ai/sdk/v2"
-import { activityForPart, elapsedLabel, normalizeMeaningful } from "./activity.js"
-import { isVisibleTask, taskSessionID, type VisibleTaskPart } from "./tasks.js"
+import { elapsedLabel } from "./activity.js"
+import {
+  canOpenTaskSession,
+  isTaskPart,
+  isVisibleTask,
+  resolveTaskModel,
+  taskAgent,
+  taskDescription,
+  taskModeLabel,
+  taskModelLabel,
+  taskSessionID,
+  taskStatusLabel,
+  taskVariantLabel,
+  type VisibleTaskPart,
+} from "./tasks.js"
 import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Show } from "solid-js"
 
-function stringValue(value: unknown): string | undefined {
-  return typeof value === "string" && value.trim() ? value.trim() : undefined
+type TaskFallback = {
+  part: VisibleTaskPart
+  sessionID?: string
+  session?: Session
 }
 
-function objectValue(value: unknown): Record<string, unknown> {
-  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {}
+type PopupOwnership = {
+  callID: string
+  token: symbol
 }
 
-function taskAgent(part: VisibleTaskPart): string {
-  return stringValue(part.state.input.subagent_type) ?? "subagent"
+function resolvedModel(api: TuiPluginApi, part: VisibleTaskPart, session: Session | undefined, sessionID?: string) {
+  return resolveTaskModel(part, session, sessionID ? api.state.session.messages(sessionID) : [])
 }
 
-function taskDescription(part: VisibleTaskPart): string {
-  return normalizeMeaningful(part.state.input.description) ?? normalizeMeaningful(objectValue(part.state).title) ?? "Working"
+function modelName(api: TuiPluginApi, model: ReturnType<typeof resolvedModel>): string {
+  const name = model
+    ? api.state.provider.find((provider) => provider.id === model.providerID)?.models[model.modelID]?.name
+    : undefined
+  return taskModelLabel(model, name)
 }
 
-function taskModel(part: VisibleTaskPart): { providerID: string; modelID: string } | undefined {
-  const metadata = objectValue(objectValue(part.state).metadata)
-  const model = objectValue(metadata.model)
-  const providerID = stringValue(model.providerID)
-  const modelID = stringValue(model.modelID)
-  return providerID && modelID ? { providerID, modelID } : undefined
-}
-
-function latestActivity(api: TuiPluginApi, sessionID: string | undefined, fallback: string): string {
-  if (!sessionID) return fallback
-
-  const messages = api.state.session.messages(sessionID)
-  for (let messageIndex = messages.length - 1; messageIndex >= 0; messageIndex -= 1) {
-    const message = messages[messageIndex]
-    if (message?.role !== "assistant") continue
-
-    const parts = api.state.part(message.id)
-    for (let partIndex = parts.length - 1; partIndex >= 0; partIndex -= 1) {
-      const candidate = parts[partIndex]
-      if (!candidate) continue
-      const activity = activityForPart(candidate)
-      if (activity) return activity
-    }
+function TaskDetails(props: {
+  api: TuiPluginApi
+  callID: string
+  currentSessionID: string
+  fallbackPart: VisibleTaskPart
+  tasksByCallID: () => Map<string, VisibleTaskPart>
+  fallbackFor: (callID: string) => TaskFallback | undefined
+  revision: () => number
+  now: () => number
+  startedAt: (part: VisibleTaskPart) => number
+  close: () => void
+}) {
+  const fallback = (): TaskFallback => {
+    const known = props.fallbackFor(props.callID)
+    if (known) return known
+    const sessionID = taskSessionID(props.fallbackPart)
+    return { part: props.fallbackPart, ...(sessionID ? { sessionID } : {}) }
   }
-  return fallback
-}
-
-function modelLabel(api: TuiPluginApi, part: VisibleTaskPart): string {
-  let model = taskModel(part)
-  const childSessionID = taskSessionID(part)
-  if (!model && childSessionID) {
-    const messages = api.state.session.messages(childSessionID)
-    for (let index = messages.length - 1; index >= 0; index -= 1) {
-      const message = messages[index]
-      if (message?.role === "assistant") {
-        model = { providerID: message.providerID, modelID: message.modelID }
-        break
-      }
-    }
+  const part = createMemo(() => {
+    props.revision()
+    return props.tasksByCallID().get(props.callID) ?? fallback().part
+  })
+  const childSessionID = () => taskSessionID(part() ?? fallback().part) ?? fallback().sessionID
+  const childSession = () => {
+    props.revision()
+    const sessionID = childSessionID()
+    return (sessionID ? props.api.state.session.get(sessionID) : undefined) ?? fallback().session
+  }
+  const model = createMemo(() => {
+    props.revision()
+    return resolvedModel(props.api, part() ?? fallback().part, childSession(), childSessionID())
+  })
+  const canOpen = () => canOpenTaskSession(childSessionID(), props.currentSessionID)
+  const openSession = () => {
+    const sessionID = childSessionID()
+    if (!canOpen() || !sessionID) return
+    props.api.route.navigate("session", { sessionID })
+    props.close()
   }
 
-  if (!model) return "starting…"
-  return api.state.provider.find((provider) => provider.id === model.providerID)?.models[model.modelID]?.name ?? model.modelID
+  return (
+    <box width="100%" flexDirection="column" padding={1} gap={1}>
+      <text fg={props.api.theme.current.text}>
+        <b>Subagent details</b>
+      </text>
+      <box flexDirection="column">
+        <text fg={props.api.theme.current.text}>Agent: {taskAgent(part() ?? fallback().part)}</text>
+        <text fg={props.api.theme.current.textMuted} wrapMode="word">
+          Assigned task: {taskDescription(part() ?? fallback().part)}
+        </text>
+        <text fg={props.api.theme.current.textMuted}>
+          Status: {taskStatusLabel(part() ?? fallback().part, childSessionID() ? props.api.state.session.status(childSessionID()!) : undefined)}
+        </text>
+        <text fg={props.api.theme.current.textMuted}>
+          Model: {modelName(props.api, model())}
+        </text>
+        <text fg={props.api.theme.current.textMuted}>
+          Effort/variant: {taskVariantLabel(model()) ?? "pending"}
+        </text>
+        <text fg={props.api.theme.current.textMuted}>
+          Elapsed: {elapsedLabel(props.now() - props.startedAt(part() ?? fallback().part))}
+        </text>
+        <text fg={props.api.theme.current.textMuted}>Child session ID: {childSessionID() ?? "Waiting for child session"}</text>
+        <text fg={props.api.theme.current.textMuted}>Mode: {taskModeLabel(part() ?? fallback().part)}</text>
+      </box>
+      <box flexDirection="row" gap={2}>
+        <box onMouseUp={openSession}>
+          <text fg={canOpen() ? props.api.theme.current.primary : props.api.theme.current.textMuted}>
+            <b>Open Session</b>
+          </text>
+        </box>
+        <box onMouseUp={props.close}>
+          <text fg={props.api.theme.current.primary}>
+            <b>Close</b>
+          </text>
+        </box>
+      </box>
+    </box>
+  )
 }
 
 function TaskCard(props: {
   api: TuiPluginApi
   callID: string
-  currentSessionID: string
   tasksByCallID: () => Map<string, VisibleTaskPart>
+  fallbackFor: (callID: string) => TaskFallback | undefined
+  remember: (part: VisibleTaskPart) => void
   revision: () => number
   now: () => number
   startedAt: (part: VisibleTaskPart) => number
+  openPopup: (callID: string, part: VisibleTaskPart) => void
 }) {
   // The call ID is stable, while the actual ToolPart is re-read after each event.
   // This prevents cards from retaining a stale part object after a state update.
   const livePart = createMemo(() => props.tasksByCallID().get(props.callID))
-  const childSessionID = () => taskSessionID(livePart()!)
-  const isCurrent = () => childSessionID() === props.currentSessionID
+  const part = () => livePart() ?? props.fallbackFor(props.callID)?.part
+  const childSession = () => {
+    props.revision()
+    const current = part()
+    if (!current) return undefined
+    const sessionID = taskSessionID(current)
+    return sessionID ? props.api.state.session.get(sessionID) : undefined
+  }
   const model = () => {
     props.revision()
-    return modelLabel(props.api, livePart()!)
+    const current = part()
+    return current ? resolvedModel(props.api, current, childSession(), taskSessionID(current)) : undefined
   }
-  const activity = () => {
-    props.revision()
-    return latestActivity(props.api, childSessionID(), taskDescription(livePart()!))
+  const elapsed = () => {
+    const current = part()
+    return current ? elapsedLabel(props.now() - props.startedAt(current)) : ""
   }
-  const elapsed = () => elapsedLabel(props.now() - props.startedAt(livePart()!))
+  const openDetails = () => {
+    if (props.api.renderer.getSelection()?.getSelectedText()) return
+    const part = livePart()
+    if (!part) return
+    props.remember(part)
+    props.openPopup(props.callID, part)
+  }
 
   return (
-    <box width="100%" height={2} overflow="hidden">
+    <box width="100%" height={2} overflow="hidden" onMouseUp={openDetails}>
       <box width="100%" height={1} flexDirection="row" overflow="hidden">
-        <text flexGrow={1} flexShrink={1} minWidth={0} wrapMode="none" truncate>
-          <span
-            style={{
-              fg:
-                livePart()!.state.status === "pending"
-                  ? props.api.theme.current.warning
-                  : props.api.theme.current.success,
-            }}
-          >
-            {isCurrent() ? "›" : livePart()!.state.status === "pending" ? "…" : "●"}
-          </span>
-          <span style={{ fg: props.api.theme.current.text }}>
-            {" "}
-            <b>{taskAgent(livePart()!)}</b>
-          </span>
+        <text flexGrow={1} flexShrink={1} minWidth={0} wrapMode="none" truncate fg={props.api.theme.current.text}>
+          <b>{part() ? taskAgent(part()!) : "subagent"}</b>
         </text>
-        <text
-          flexShrink={0}
-          maxWidth={20}
+        <box
+          flexShrink={1}
+          minWidth={0}
+          maxWidth={28}
           marginLeft={1}
-          wrapMode="none"
-          truncate
-          fg={props.api.theme.current.textMuted}
+          flexDirection="row"
         >
-          {model()}
-        </text>
+          <text flexGrow={1} flexShrink={1} minWidth={0} wrapMode="none" truncate fg={props.api.theme.current.textMuted}>
+            {modelName(props.api, model())}
+          </text>
+          <Show
+            when={taskVariantLabel(model())}
+            fallback={
+              <Show when={model()}>
+                <text flexShrink={0} marginLeft={1} wrapMode="none" truncate fg={props.api.theme.current.textMuted}>
+                  · pending
+                </text>
+              </Show>
+            }
+          >
+            {(variant) => (
+              <text flexShrink={0} marginLeft={1} wrapMode="none" truncate fg={props.api.theme.current.textMuted}>
+                · {variant()}
+              </text>
+            )}
+          </Show>
+        </box>
       </box>
       <box width="100%" height={1} flexDirection="row" overflow="hidden">
         <text
@@ -130,18 +204,13 @@ function TaskCard(props: {
           truncate
           fg={props.api.theme.current.textMuted}
         >
-          {activity()}
+          {part() ? taskDescription(part()!) : "Working"}
         </text>
-        <text
-          width={8}
-          flexShrink={0}
-          marginLeft={1}
-          wrapMode="none"
-          truncate
-          fg={props.api.theme.current.textMuted}
-        >
-          {elapsed()}
-        </text>
+        <box width={8} flexShrink={0} justifyContent="flex-end">
+          <text wrapMode="none" truncate fg={props.api.theme.current.textMuted}>
+            {elapsed()}
+          </text>
+        </box>
       </box>
     </box>
   )
@@ -153,6 +222,8 @@ function RunningSubagents(props: { api: TuiPluginApi; sessionID: string }) {
   const [revision, setRevision] = createSignal(0)
   const [now, setNow] = createSignal(Date.now())
   const firstSeen = new Map<string, number>()
+  const fallbacks = new Map<string, TaskFallback>()
+  const [openPopup, setOpenPopup] = createSignal<PopupOwnership>()
   let sessionRequest = 0
 
   const loadMessages = async (sessionID: string, request: number): Promise<void> => {
@@ -200,7 +271,7 @@ function RunningSubagents(props: { api: TuiPluginApi; sessionID: string }) {
 
   createEffect(on(() => props.sessionID, (sessionID) => void selectSession(sessionID)))
 
-  const running = createMemo(() => {
+  const allTaskParts = createMemo(() => {
     revision()
     const sessionID = scopeSessionID()
     if (!sessionID) return []
@@ -209,13 +280,38 @@ function RunningSubagents(props: { api: TuiPluginApi; sessionID: string }) {
     const parts = messages.length
       ? messages.flatMap((message) => props.api.state.part(message.id))
       : hydratedMessages().flatMap((message) => message.parts)
-    return parts.filter((part) => isVisibleTask(part, props.api.state.session.status))
+    return parts.filter(isTaskPart)
   })
-  const tasksByCallID = createMemo(() => new Map(running().map((part) => [part.callID, part])))
-  const taskCallIDs = createMemo(() => running().map((part) => part.callID))
+  const visibleTaskParts = createMemo(() => allTaskParts().filter((part) => isVisibleTask(part, props.api.state.session.status)))
+  // Popups need the direct parent's complete/error parts too, even after their
+  // visible card has gone away.
+  const tasksByCallID = createMemo(() => new Map(allTaskParts().map((part) => [part.callID, part])))
+  const taskCallIDs = createMemo(() => visibleTaskParts().map((part) => part.callID))
   const activeChildSessions = createMemo(
-    () => new Set(running().map(taskSessionID).filter((sessionID): sessionID is string => Boolean(sessionID))),
+    () => new Set(visibleTaskParts().map(taskSessionID).filter((sessionID): sessionID is string => Boolean(sessionID))),
   )
+
+  const remember = (part: VisibleTaskPart): void => {
+    const sessionID = taskSessionID(part)
+    const session = sessionID ? props.api.state.session.get(sessionID) : undefined
+    fallbacks.set(part.callID, { part, ...(sessionID ? { sessionID } : {}), ...(session ? { session } : {}) })
+  }
+  const rememberLiveTasks = () => {
+    revision()
+    for (const part of allTaskParts()) remember(part)
+  }
+  createEffect(rememberLiveTasks)
+
+  const popupPart = createMemo(() => {
+    revision()
+    const callID = openPopup()?.callID
+    return callID ? tasksByCallID().get(callID) ?? fallbacks.get(callID)?.part : undefined
+  })
+  const popupSessionID = createMemo(() => {
+    const callID = openPopup()?.callID
+    const part = popupPart()
+    return (part ? taskSessionID(part) : undefined) ?? (callID ? fallbacks.get(callID)?.sessionID : undefined)
+  })
 
   const startedAt = (part: VisibleTaskPart): number => {
     if (part.state.status !== "pending") return part.state.time.start
@@ -226,18 +322,45 @@ function RunningSubagents(props: { api: TuiPluginApi; sessionID: string }) {
     return value
   }
 
+  const releasePopup = (ownership: PopupOwnership): void => {
+    if (openPopup()?.token === ownership.token) setOpenPopup(undefined)
+  }
+  const closePopup = (ownership: PopupOwnership): void => {
+    if (openPopup()?.token !== ownership.token) return
+    setOpenPopup(undefined)
+    props.api.ui.dialog.clear()
+  }
+  const showPopup = (callID: string, part: VisibleTaskPart): void => {
+    const ownership = { callID, token: Symbol(callID) }
+    setOpenPopup(ownership)
+    props.api.ui.dialog.replace(() => (
+      <TaskDetails
+        api={props.api}
+        callID={callID}
+        currentSessionID={props.sessionID}
+        fallbackPart={part}
+        tasksByCallID={tasksByCallID}
+        fallbackFor={(id) => fallbacks.get(id)}
+        revision={revision}
+        now={now}
+        startedAt={startedAt}
+        close={() => closePopup(ownership)}
+      />
+    ), () => releasePopup(ownership))
+  }
+
   const unregister: Array<() => void> = []
   let timer: ReturnType<typeof setInterval> | undefined
 
   onMount(() => {
     const syncCurrentSession = (session: Session) => {
       if (session.id === props.sessionID) void selectSession(session.id, session)
-      if (session.parentID === scopeSessionID() || activeChildSessions().has(session.id)) {
+      if (session.parentID === scopeSessionID() || activeChildSessions().has(session.id) || session.id === popupSessionID()) {
         setRevision((value) => value + 1)
       }
     }
     const refreshSession = (sessionID: string) => {
-      if (sessionID === scopeSessionID() || activeChildSessions().has(sessionID)) {
+      if (sessionID === scopeSessionID() || activeChildSessions().has(sessionID) || sessionID === popupSessionID()) {
         setRevision((value) => value + 1)
       }
     }
@@ -256,6 +379,8 @@ function RunningSubagents(props: { api: TuiPluginApi; sessionID: string }) {
     sessionRequest += 1
     if (timer) clearInterval(timer)
     for (const dispose of unregister) dispose()
+    const ownership = openPopup()
+    if (ownership) closePopup(ownership)
   })
 
   return (
@@ -263,7 +388,7 @@ function RunningSubagents(props: { api: TuiPluginApi; sessionID: string }) {
       <text fg={props.api.theme.current.text}>
         <b>Subagents</b>
         <span style={{ fg: props.api.theme.current.textMuted }}>
-          {running().length ? ` (${running().length} running)` : ""}
+          {visibleTaskParts().length ? ` (${visibleTaskParts().length} running)` : ""}
         </span>
       </text>
 
@@ -276,11 +401,13 @@ function RunningSubagents(props: { api: TuiPluginApi; sessionID: string }) {
             <TaskCard
               api={props.api}
               callID={callID}
-              currentSessionID={props.sessionID}
               tasksByCallID={tasksByCallID}
+              fallbackFor={(id) => fallbacks.get(id)}
+              remember={remember}
               revision={revision}
               now={now}
               startedAt={startedAt}
+              openPopup={showPopup}
             />
           )}
         </For>
