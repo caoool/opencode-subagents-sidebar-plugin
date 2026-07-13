@@ -2,11 +2,15 @@
 
 import type { TuiPlugin, TuiPluginApi, TuiPluginModule } from "@opencode-ai/plugin/tui"
 import type { Message, Part, Session } from "@opencode-ai/sdk/v2"
+import type { BoxRenderable } from "@opentui/core"
+import { Portal } from "@opentui/solid"
 import { elapsedLabel } from "./activity.js"
+import { placePopover, type PopoverAnchor } from "./popover.js"
 import {
   canOpenTaskSession,
   isTaskPart,
   isVisibleTask,
+  latestAssistantText,
   resolveTaskModel,
   taskAgent,
   taskDescription,
@@ -25,10 +29,19 @@ type TaskFallback = {
   session?: Session
 }
 
+type SessionMessageWithParts = {
+  info: Message
+  parts: ReadonlyArray<Part>
+}
+
 type PopupOwnership = {
   callID: string
   token: symbol
+  anchor: PopoverAnchor
 }
+
+const POPOVER_SIZE = { width: 52, height: 14 }
+const POPOVER_Z_INDEX = 100
 
 function resolvedModel(api: TuiPluginApi, part: VisibleTaskPart, session: Session | undefined, sessionID?: string) {
   return resolveTaskModel(part, session, sessionID ? api.state.session.messages(sessionID) : [])
@@ -41,9 +54,9 @@ function modelName(api: TuiPluginApi, model: ReturnType<typeof resolvedModel>): 
   return taskModelLabel(model, name)
 }
 
-function TaskDetails(props: {
+function TaskPopover(props: {
   api: TuiPluginApi
-  callID: string
+  ownership: () => PopupOwnership
   currentSessionID: string
   fallbackPart: VisibleTaskPart
   tasksByCallID: () => Map<string, VisibleTaskPart>
@@ -53,15 +66,27 @@ function TaskDetails(props: {
   startedAt: (part: VisibleTaskPart) => number
   close: () => void
 }) {
+  const [viewport, setViewport] = createSignal({ width: props.api.renderer.width, height: props.api.renderer.height })
+  const [hydratedChildMessages, setHydratedChildMessages] = createSignal<{
+    token: symbol
+    sessionID: string
+    messages: ReadonlyArray<SessionMessageWithParts>
+  }>()
+  const placement = createMemo(() => placePopover(props.ownership().anchor, viewport(), POPOVER_SIZE))
+  const callID = () => props.ownership().callID
+  let portalWrapper: BoxRenderable | undefined
+  let hydrationRequest = 0
+  let requestedHydration: { token: symbol; sessionID: string } | undefined
+
   const fallback = (): TaskFallback => {
-    const known = props.fallbackFor(props.callID)
+    const known = props.fallbackFor(callID())
     if (known) return known
     const sessionID = taskSessionID(props.fallbackPart)
     return { part: props.fallbackPart, ...(sessionID ? { sessionID } : {}) }
   }
   const part = createMemo(() => {
     props.revision()
-    return props.tasksByCallID().get(props.callID) ?? fallback().part
+    return props.tasksByCallID().get(callID()) ?? fallback().part
   })
   const childSessionID = () => taskSessionID(part() ?? fallback().part) ?? fallback().sessionID
   const childSession = () => {
@@ -74,6 +99,75 @@ function TaskDetails(props: {
     return resolvedModel(props.api, part() ?? fallback().part, childSession(), childSessionID())
   })
   const canOpen = () => canOpenTaskSession(childSessionID(), props.currentSessionID)
+  const liveChildMessages = createMemo(() => {
+    props.revision()
+    const sessionID = childSessionID()
+    if (!sessionID) return undefined
+
+    const messages = props.api.state.session.messages(sessionID)
+    const parts = new Map<string, ReadonlyArray<Part>>()
+    let hasParts = false
+    for (const message of messages) {
+      const messageParts = props.api.state.part(message.id)
+      parts.set(message.id, messageParts)
+      if (messageParts.length) hasParts = true
+    }
+    return { sessionID, messages, parts, hasParts }
+  })
+  const ownsHydration = (token: symbol, sessionID: string, request: number): boolean => {
+    if (props.api.lifecycle.signal.aborted || request !== hydrationRequest) return false
+    return props.ownership().token === token && childSessionID() === sessionID
+  }
+  const hydrateChildMessages = async (token: symbol, sessionID: string, request: number): Promise<void> => {
+    try {
+      const result = await props.api.client.session.messages(
+        { sessionID, directory: props.api.state.path.directory },
+        { throwOnError: true },
+      )
+      if (!ownsHydration(token, sessionID, request)) return
+      if (liveChildMessages()?.hasParts) return
+      setHydratedChildMessages({ token, sessionID, messages: result.data })
+    } catch {
+      if (ownsHydration(token, sessionID, request)) requestedHydration = undefined
+    }
+  }
+
+  createEffect(() => {
+    const ownership = props.ownership()
+    const sessionID = childSessionID()
+    const live = liveChildMessages()
+    if (!sessionID || live?.hasParts) {
+      if (requestedHydration) {
+        requestedHydration = undefined
+        hydrationRequest += 1
+      }
+      return
+    }
+    if (requestedHydration?.token === ownership.token && requestedHydration.sessionID === sessionID) return
+
+    const request = ++hydrationRequest
+    requestedHydration = { token: ownership.token, sessionID }
+    setHydratedChildMessages(undefined)
+    void hydrateChildMessages(ownership.token, sessionID, request)
+  })
+
+  const latestResponse = createMemo(() => {
+    const ownership = props.ownership()
+    const sessionID = childSessionID()
+    if (!sessionID) return undefined
+
+    const live = liveChildMessages()
+    if (live?.hasParts) return latestAssistantText(live.messages, (messageID) => live.parts.get(messageID) ?? [])
+
+    const hydrated = hydratedChildMessages()
+    if (!hydrated || hydrated.token !== ownership.token || hydrated.sessionID !== sessionID) return undefined
+    const parts = new Map(hydrated.messages.map((message) => [message.info.id, message.parts]))
+    return latestAssistantText(
+      hydrated.messages.map((message) => message.info),
+      (messageID) => parts.get(messageID) ?? [],
+    )
+  })
+  const responseLabel = () => latestResponse() ?? (childSessionID() ? "Waiting for assistant response" : "Waiting for child session")
   const openSession = () => {
     const sessionID = childSessionID()
     if (!canOpen() || !sessionID) return
@@ -81,44 +175,91 @@ function TaskDetails(props: {
     props.close()
   }
 
+  const applyPortalPlacement = (next = placement()): void => {
+    const wrapper = portalWrapper
+    if (!wrapper || wrapper.isDestroyed) return
+    wrapper.position = "absolute"
+    wrapper.left = next.left
+    wrapper.top = next.top
+    wrapper.width = next.width
+    wrapper.height = next.height
+    wrapper.zIndex = POPOVER_Z_INDEX
+    wrapper.focusable = false
+  }
+  createEffect(() => applyPortalPlacement(placement()))
+
+  onMount(() => {
+    const updateViewport = (width: number, height: number) => {
+      setViewport((current) => (current.width === width && current.height === height ? current : { width, height }))
+    }
+    props.api.renderer.on("resize", updateViewport)
+    onCleanup(() => props.api.renderer.off("resize", updateViewport))
+  })
+
+  onCleanup(() => {
+    hydrationRequest += 1
+    requestedHydration = undefined
+    portalWrapper = undefined
+  })
+
   return (
-    <box width="100%" flexDirection="column" padding={1} gap={1}>
-      <text fg={props.api.theme.current.text}>
-        <b>Subagent details</b>
-      </text>
-      <box flexDirection="column">
-        <text fg={props.api.theme.current.text}>Agent: {taskAgent(part() ?? fallback().part)}</text>
-        <text fg={props.api.theme.current.textMuted} wrapMode="word">
-          Assigned task: {taskDescription(part() ?? fallback().part)}
+    <Portal
+      mount={props.api.renderer.root}
+      ref={(element) => {
+        portalWrapper = element as BoxRenderable
+        applyPortalPlacement()
+      }}
+    >
+      <box
+        width="100%"
+        height="100%"
+        focusable={false}
+        live
+        border
+        borderColor={props.api.theme.current.borderActive}
+        backgroundColor={props.api.theme.current.backgroundPanel}
+        padding={1}
+        flexDirection="column"
+        overflow="hidden"
+      >
+        <text fg={props.api.theme.current.text} wrapMode="none" truncate>
+          <b>Subagent details</b>
         </text>
-        <text fg={props.api.theme.current.textMuted}>
+        <text fg={props.api.theme.current.text} wrapMode="none" truncate>
+          Agent: {taskAgent(part() ?? fallback().part)}
+        </text>
+        <text fg={props.api.theme.current.textMuted} wrapMode="none" truncate>
+          Assigned: {taskDescription(part() ?? fallback().part)}
+        </text>
+        <text fg={props.api.theme.current.textMuted} wrapMode="none" truncate>
+          Latest: {responseLabel()}
+        </text>
+        <text fg={props.api.theme.current.textMuted} wrapMode="none" truncate>
           Status: {taskStatusLabel(part() ?? fallback().part, childSessionID() ? props.api.state.session.status(childSessionID()!) : undefined)}
         </text>
-        <text fg={props.api.theme.current.textMuted}>
-          Model: {modelName(props.api, model())}
+        <text fg={props.api.theme.current.textMuted} wrapMode="none" truncate>
+          Model: {modelName(props.api, model())} · {taskVariantLabel(model()) ?? "pending"}
         </text>
-        <text fg={props.api.theme.current.textMuted}>
-          Effort/variant: {taskVariantLabel(model()) ?? "pending"}
+        <text fg={props.api.theme.current.textMuted} wrapMode="none" truncate>
+          {taskModeLabel(part() ?? fallback().part)} · {elapsedLabel(props.now() - props.startedAt(part() ?? fallback().part))}
         </text>
-        <text fg={props.api.theme.current.textMuted}>
-          Elapsed: {elapsedLabel(props.now() - props.startedAt(part() ?? fallback().part))}
+        <text fg={props.api.theme.current.textMuted} wrapMode="none" truncate>
+          Child: {childSessionID() ?? "Waiting for child session"}
         </text>
-        <text fg={props.api.theme.current.textMuted}>Child session ID: {childSessionID() ?? "Waiting for child session"}</text>
-        <text fg={props.api.theme.current.textMuted}>Mode: {taskModeLabel(part() ?? fallback().part)}</text>
-      </box>
-      <box flexDirection="row" gap={2}>
-        <box onMouseUp={openSession}>
-          <text fg={canOpen() ? props.api.theme.current.primary : props.api.theme.current.textMuted}>
-            <b>Open Session</b>
-          </text>
-        </box>
-        <box onMouseUp={props.close}>
-          <text fg={props.api.theme.current.primary}>
-            <b>Close</b>
-          </text>
+        <box flexDirection="row" gap={2}>
+          <box onMouseUp={openSession}>
+            <text fg={canOpen() ? props.api.theme.current.primary : props.api.theme.current.textMuted}>
+              <b>Open Session</b>
+            </text>
+          </box>
+          <box onMouseUp={props.close}>
+            <text fg={props.api.theme.current.primary}>
+              <b>Close</b>
+            </text>
+          </box>
         </box>
       </box>
-    </box>
+    </Portal>
   )
 }
 
@@ -131,7 +272,8 @@ function TaskCard(props: {
   revision: () => number
   now: () => number
   startedAt: (part: VisibleTaskPart) => number
-  openPopup: (callID: string, part: VisibleTaskPart) => void
+  openPopup: (callID: string, anchor: PopoverAnchor) => void
+  updatePopupAnchor: (callID: string, anchor: PopoverAnchor) => void
 }) {
   // The call ID is stable, while the actual ToolPart is re-read after each event.
   // This prevents cards from retaining a stale part object after a state update.
@@ -153,16 +295,54 @@ function TaskCard(props: {
     const current = part()
     return current ? elapsedLabel(props.now() - props.startedAt(current)) : ""
   }
+  let card: BoxRenderable | undefined
+  let lastAnchor: PopoverAnchor | undefined
+  const anchor = (): PopoverAnchor | undefined =>
+    card && { x: card.screenX, y: card.screenY, width: card.width, height: card.height }
+  const updateAnchor = (): void => {
+    const current = anchor()
+    if (
+      !current ||
+      (lastAnchor &&
+        lastAnchor.x === current.x &&
+        lastAnchor.y === current.y &&
+        lastAnchor.width === current.width &&
+        lastAnchor.height === current.height)
+    ) {
+      return
+    }
+    lastAnchor = current
+    props.updatePopupAnchor(props.callID, current)
+  }
+  onCleanup(() => {
+    // The popover owns its last reported rect, so losing this card must not
+    // reset its placement before the user explicitly closes it.
+    card = undefined
+    lastAnchor = undefined
+  })
   const openDetails = () => {
     if (props.api.renderer.getSelection()?.getSelectedText()) return
     const part = livePart()
-    if (!part) return
+    const currentAnchor = anchor()
+    if (!part || !currentAnchor) return
     props.remember(part)
-    props.openPopup(props.callID, part)
+    props.openPopup(props.callID, currentAnchor)
   }
 
   return (
-    <box width="100%" height={2} overflow="hidden" onMouseUp={openDetails}>
+    <box
+      ref={(element) => {
+        card = element
+        updateAnchor()
+      }}
+      onSizeChange={updateAnchor}
+      renderBefore={updateAnchor}
+      width="100%"
+      height={2}
+      flexDirection="column"
+      overflow="hidden"
+      onMouseUp={openDetails}
+    >
       <box width="100%" height={1} flexDirection="row" overflow="hidden">
         <text flexGrow={1} flexShrink={1} minWidth={0} wrapMode="none" truncate fg={props.api.theme.current.text}>
           <b>{part() ? taskAgent(part()!) : "subagent"}</b>
@@ -206,7 +386,7 @@ function TaskCard(props: {
         >
           {part() ? taskDescription(part()!) : "Working"}
         </text>
-        <box width={8} flexShrink={0} justifyContent="flex-end">
+        <box width={8} flexShrink={0} flexDirection="row" justifyContent="flex-end">
           <text wrapMode="none" truncate fg={props.api.theme.current.textMuted}>
             {elapsed()}
           </text>
@@ -218,7 +398,7 @@ function TaskCard(props: {
 
 function RunningSubagents(props: { api: TuiPluginApi; sessionID: string }) {
   const [scopeSessionID, setScopeSessionID] = createSignal<string>()
-  const [hydratedMessages, setHydratedMessages] = createSignal<ReadonlyArray<{ info: Message; parts: ReadonlyArray<Part> }>>([])
+  const [hydratedMessages, setHydratedMessages] = createSignal<ReadonlyArray<SessionMessageWithParts>>([])
   const [revision, setRevision] = createSignal(0)
   const [now, setNow] = createSignal(Date.now())
   const firstSeen = new Map<string, number>()
@@ -269,7 +449,12 @@ function RunningSubagents(props: { api: TuiPluginApi; sessionID: string }) {
     void loadMessages(parentSessionID, currentRequest)
   }
 
-  createEffect(on(() => props.sessionID, (sessionID) => void selectSession(sessionID)))
+  createEffect(
+    on(() => props.sessionID, (sessionID, previousSessionID) => {
+      if (previousSessionID !== undefined && sessionID !== previousSessionID) setOpenPopup(undefined)
+      void selectSession(sessionID)
+    }),
+  )
 
   const allTaskParts = createMemo(() => {
     revision()
@@ -322,32 +507,31 @@ function RunningSubagents(props: { api: TuiPluginApi; sessionID: string }) {
     return value
   }
 
-  const releasePopup = (ownership: PopupOwnership): void => {
-    if (openPopup()?.token === ownership.token) setOpenPopup(undefined)
-  }
   const closePopup = (ownership: PopupOwnership): void => {
     if (openPopup()?.token !== ownership.token) return
     setOpenPopup(undefined)
-    props.api.ui.dialog.clear()
   }
-  const showPopup = (callID: string, part: VisibleTaskPart): void => {
-    const ownership = { callID, token: Symbol(callID) }
+  const showPopup = (callID: string, anchor: PopoverAnchor): void => {
+    const ownership = { callID, token: Symbol(callID), anchor }
     setOpenPopup(ownership)
-    props.api.ui.dialog.replace(() => (
-      <TaskDetails
-        api={props.api}
-        callID={callID}
-        currentSessionID={props.sessionID}
-        fallbackPart={part}
-        tasksByCallID={tasksByCallID}
-        fallbackFor={(id) => fallbacks.get(id)}
-        revision={revision}
-        now={now}
-        startedAt={startedAt}
-        close={() => closePopup(ownership)}
-      />
-    ), () => releasePopup(ownership))
   }
+  const updatePopupAnchor = (callID: string, anchor: PopoverAnchor): void => {
+    const ownership = openPopup()
+    if (!ownership || ownership.callID !== callID) return
+    if (
+      ownership.anchor.x === anchor.x &&
+      ownership.anchor.y === anchor.y &&
+      ownership.anchor.width === anchor.width &&
+      ownership.anchor.height === anchor.height
+    ) {
+      return
+    }
+    setOpenPopup({ ...ownership, anchor })
+  }
+  const dismissForHostDialog = (): void => {
+    if (openPopup() && props.api.ui.dialog.open) setOpenPopup(undefined)
+  }
+  createEffect(dismissForHostDialog)
 
   const unregister: Array<() => void> = []
   let timer: ReturnType<typeof setInterval> | undefined
@@ -366,12 +550,16 @@ function RunningSubagents(props: { api: TuiPluginApi; sessionID: string }) {
     }
 
     unregister.push(
+      () => {
+        props.api.renderer.off("frame", dismissForHostDialog)
+      },
       props.api.event.on("session.created", (event) => syncCurrentSession(event.properties.info)),
       props.api.event.on("session.updated", (event) => syncCurrentSession(event.properties.info)),
       props.api.event.on("message.updated", (event) => refreshSession(event.properties.sessionID)),
       props.api.event.on("message.part.updated", (event) => refreshSession(event.properties.sessionID)),
       props.api.event.on("message.part.removed", (event) => refreshSession(event.properties.sessionID)),
     )
+    props.api.renderer.on("frame", dismissForHostDialog)
     timer = setInterval(() => setNow(Date.now()), 1_000)
   })
 
@@ -379,8 +567,7 @@ function RunningSubagents(props: { api: TuiPluginApi; sessionID: string }) {
     sessionRequest += 1
     if (timer) clearInterval(timer)
     for (const dispose of unregister) dispose()
-    const ownership = openPopup()
-    if (ownership) closePopup(ownership)
+    setOpenPopup(undefined)
   })
 
   return (
@@ -408,9 +595,26 @@ function RunningSubagents(props: { api: TuiPluginApi; sessionID: string }) {
               now={now}
               startedAt={startedAt}
               openPopup={showPopup}
+              updatePopupAnchor={updatePopupAnchor}
             />
           )}
         </For>
+      </Show>
+      <Show when={openPopup()}>
+        {(ownership) => (
+          <TaskPopover
+            api={props.api}
+            ownership={ownership}
+            currentSessionID={props.sessionID}
+            fallbackPart={fallbacks.get(ownership().callID)!.part}
+            tasksByCallID={tasksByCallID}
+            fallbackFor={(id) => fallbacks.get(id)}
+            revision={revision}
+            now={now}
+            startedAt={startedAt}
+            close={() => closePopup(ownership())}
+          />
+        )}
       </Show>
     </box>
   )

@@ -6,11 +6,17 @@ parent session (or when viewing one of its child sessions).
 
 Each subagent uses a compact two-line card: its role with model and raw
 effort/reasoning variant, then its assigned task description with a
-right-aligned elapsed runtime. Cards intentionally do not show status glyphs
-or live transcript/activity text. Click anywhere on a card to open a live
-details popup with status, foreground/background mode, child session ID, and
-model details. The popup's **Open Session** action is available once the child
-session exists (unless it is already open); **Close** dismisses the popup.
+right-aligned elapsed runtime. Click anywhere on a card to open a non-modal,
+live popover attached to that card (left first, then right, with above/below
+fallbacks on narrow terminals). It shows status, foreground/background mode,
+child session ID, model details, and the newest visible assistant reply as a
+single truncated line. When the public TUI state has not populated the child
+transcript yet, the plugin hydrates it without overriding newer live state. It
+waits for the child session or assistant reply when that information is not
+available yet. Opening another card replaces the popover; navigating away,
+opening a host dialog, or closing the popover dismisses it. The popup's **Open
+Session** action is available once the child session exists (unless it is
+already open); **Close** dismisses the popover.
 Completed tasks are hidden unless OpenCode still reports their background child
 session as active.
 

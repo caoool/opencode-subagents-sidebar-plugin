@@ -42,6 +42,26 @@ export function taskDescription(part: VisibleTaskPart): string {
   return normalizeTaskDescription(part.state.input.description) ?? normalizeTaskDescription(objectValue(part.state).title) ?? "Working"
 }
 
+/** Returns the latest visible assistant response as a single display line. */
+export function latestAssistantText(
+  messages: ReadonlyArray<Message>,
+  partsForMessage: (messageID: string) => ReadonlyArray<Part>,
+): string | undefined {
+  for (let messageIndex = messages.length - 1; messageIndex >= 0; messageIndex -= 1) {
+    const message = messages[messageIndex]
+    if (!message || message.role !== "assistant") continue
+
+    const text = partsForMessage(message.id)
+      .filter((part): part is Extract<Part, { type: "text" }> => part.type === "text" && !part.ignored)
+      .map((part) => part.text)
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim()
+    if (text) return text
+  }
+  return undefined
+}
+
 function taskMetadataModel(part: VisibleTaskPart): TaskModel | undefined {
   const model = objectValue(taskMetadata(part).model)
   const providerID = stringValue(model.providerID)
