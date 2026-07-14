@@ -9,7 +9,7 @@ import { setProp as _$setProp } from "@opentui/solid";
 import { createElement as _$createElement } from "@opentui/solid";
 /** @jsxImportSource @opentui/solid */
 
-import { Portal } from "@opentui/solid";
+import { Portal, useTerminalDimensions } from "@opentui/solid";
 import { elapsedLabel } from "./activity.js";
 import { placePopover } from "./popover.js";
 import { canOpenTaskSession, isTaskPart, isVisibleTask, latestAssistantText, resolveTaskModel, taskAgent, taskDescription, taskModeLabel, taskModelLabel, taskSessionID, taskStatusLabel, taskVariantLabel } from "./tasks.js";
@@ -27,10 +27,7 @@ function modelName(api, model) {
   return taskModelLabel(model, name);
 }
 function TaskPopover(props) {
-  const [viewport, setViewport] = createSignal({
-    width: props.api.renderer.width,
-    height: props.api.renderer.height
-  });
+  const viewport = useTerminalDimensions();
   const [hydratedChildMessages, setHydratedChildMessages] = createSignal();
   const placement = createMemo(() => placePopover(props.ownership().anchor, viewport(), POPOVER_SIZE));
   const callID = () => props.ownership().callID;
@@ -157,16 +154,6 @@ function TaskPopover(props) {
     wrapper.focusable = false;
   };
   createEffect(() => applyPortalPlacement(placement()));
-  onMount(() => {
-    const updateViewport = (width, height) => {
-      setViewport(current => current.width === width && current.height === height ? current : {
-        width,
-        height
-      });
-    };
-    props.api.renderer.on("resize", updateViewport);
-    onCleanup(() => props.api.renderer.off("resize", updateViewport));
-  });
   onCleanup(() => {
     hydrationRequest += 1;
     requestedHydration = undefined;
@@ -626,6 +613,9 @@ function RunningSubagents(props) {
   const dismissForHostDialog = () => {
     if (openPopup() && props.api.ui.dialog.open) setOpenPopup(undefined);
   };
+  const dismissForHostDialogFrame = async () => {
+    dismissForHostDialog();
+  };
   createEffect(dismissForHostDialog);
   const unregister = [];
   let timer;
@@ -642,9 +632,9 @@ function RunningSubagents(props) {
       }
     };
     unregister.push(() => {
-      props.api.renderer.off("frame", dismissForHostDialog);
+      props.api.renderer.removeFrameCallback(dismissForHostDialogFrame);
     }, props.api.event.on("session.created", event => syncCurrentSession(event.properties.info)), props.api.event.on("session.updated", event => syncCurrentSession(event.properties.info)), props.api.event.on("message.updated", event => refreshSession(event.properties.sessionID)), props.api.event.on("message.part.updated", event => refreshSession(event.properties.sessionID)), props.api.event.on("message.part.removed", event => refreshSession(event.properties.sessionID)));
-    props.api.renderer.on("frame", dismissForHostDialog);
+    props.api.renderer.setFrameCallback(dismissForHostDialogFrame);
     timer = setInterval(() => setNow(Date.now()), 1_000);
   });
   onCleanup(() => {

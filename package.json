@@ -1,6 +1,6 @@
 {
   "name": "opencode-subagents-sidebar-plugin",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "OpenCode TUI sidebar footer for active subagents.",
   "keywords": [
     "opencode",

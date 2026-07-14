@@ -3,7 +3,7 @@
 import type { TuiPlugin, TuiPluginApi, TuiPluginModule } from "@opencode-ai/plugin/tui"
 import type { Message, Part, Session } from "@opencode-ai/sdk/v2"
 import type { BoxRenderable } from "@opentui/core"
-import { Portal } from "@opentui/solid"
+import { Portal, useTerminalDimensions } from "@opentui/solid"
 import { elapsedLabel } from "./activity.js"
 import { placePopover, type PopoverAnchor } from "./popover.js"
 import {
@@ -66,7 +66,7 @@ function TaskPopover(props: {
   startedAt: (part: VisibleTaskPart) => number
   close: () => void
 }) {
-  const [viewport, setViewport] = createSignal({ width: props.api.renderer.width, height: props.api.renderer.height })
+  const viewport = useTerminalDimensions()
   const [hydratedChildMessages, setHydratedChildMessages] = createSignal<{
     token: symbol
     sessionID: string
@@ -187,14 +187,6 @@ function TaskPopover(props: {
     wrapper.focusable = false
   }
   createEffect(() => applyPortalPlacement(placement()))
-
-  onMount(() => {
-    const updateViewport = (width: number, height: number) => {
-      setViewport((current) => (current.width === width && current.height === height ? current : { width, height }))
-    }
-    props.api.renderer.on("resize", updateViewport)
-    onCleanup(() => props.api.renderer.off("resize", updateViewport))
-  })
 
   onCleanup(() => {
     hydrationRequest += 1
@@ -531,6 +523,9 @@ function RunningSubagents(props: { api: TuiPluginApi; sessionID: string }) {
   const dismissForHostDialog = (): void => {
     if (openPopup() && props.api.ui.dialog.open) setOpenPopup(undefined)
   }
+  const dismissForHostDialogFrame = async (): Promise<void> => {
+    dismissForHostDialog()
+  }
   createEffect(dismissForHostDialog)
 
   const unregister: Array<() => void> = []
@@ -551,7 +546,7 @@ function RunningSubagents(props: { api: TuiPluginApi; sessionID: string }) {
 
     unregister.push(
       () => {
-        props.api.renderer.off("frame", dismissForHostDialog)
+        props.api.renderer.removeFrameCallback(dismissForHostDialogFrame)
       },
       props.api.event.on("session.created", (event) => syncCurrentSession(event.properties.info)),
       props.api.event.on("session.updated", (event) => syncCurrentSession(event.properties.info)),
@@ -559,7 +554,7 @@ function RunningSubagents(props: { api: TuiPluginApi; sessionID: string }) {
       props.api.event.on("message.part.updated", (event) => refreshSession(event.properties.sessionID)),
       props.api.event.on("message.part.removed", (event) => refreshSession(event.properties.sessionID)),
     )
-    props.api.renderer.on("frame", dismissForHostDialog)
+    props.api.renderer.setFrameCallback(dismissForHostDialogFrame)
     timer = setInterval(() => setNow(Date.now()), 1_000)
   })
 
