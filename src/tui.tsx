@@ -2,15 +2,14 @@
 
 import type { TuiPlugin, TuiPluginApi, TuiPluginModule } from "@opencode-ai/plugin/tui"
 import type { Message, Part, Session } from "@opencode-ai/sdk/v2"
-import type { BoxRenderable } from "@opentui/core"
+import type { BoxRenderable, MouseEvent } from "@opentui/core"
 import { Portal, useTerminalDimensions } from "@opentui/solid"
-import { elapsedLabel } from "./activity.js"
+import { elapsedLabel, latestAssistantActivity } from "./activity.js"
 import { placePopover, type PopoverAnchor } from "./popover.js"
 import {
   canOpenTaskSession,
   isTaskPart,
   isVisibleTask,
-  latestAssistantText,
   resolveTaskModel,
   taskAgent,
   taskDescription,
@@ -76,7 +75,6 @@ function TaskPopover(props: {
   const callID = () => props.ownership().callID
   let portalWrapper: BoxRenderable | undefined
   let hydrationRequest = 0
-  let requestedHydration: { token: symbol; sessionID: string } | undefined
 
   const fallback = (): TaskFallback => {
     const known = props.fallbackFor(callID())
@@ -106,13 +104,11 @@ function TaskPopover(props: {
 
     const messages = props.api.state.session.messages(sessionID)
     const parts = new Map<string, ReadonlyArray<Part>>()
-    let hasParts = false
     for (const message of messages) {
       const messageParts = props.api.state.part(message.id)
       parts.set(message.id, messageParts)
-      if (messageParts.length) hasParts = true
     }
-    return { sessionID, messages, parts, hasParts }
+    return { sessionID, messages, parts }
   })
   const ownsHydration = (token: symbol, sessionID: string, request: number): boolean => {
     if (props.api.lifecycle.signal.aborted || request !== hydrationRequest) return false
@@ -125,29 +121,22 @@ function TaskPopover(props: {
         { throwOnError: true },
       )
       if (!ownsHydration(token, sessionID, request)) return
-      if (liveChildMessages()?.hasParts) return
       setHydratedChildMessages({ token, sessionID, messages: result.data })
-    } catch {
-      if (ownsHydration(token, sessionID, request)) requestedHydration = undefined
-    }
+    } catch {}
   }
 
   createEffect(() => {
+    props.revision()
+    props.now()
     const ownership = props.ownership()
     const sessionID = childSessionID()
-    const live = liveChildMessages()
-    if (!sessionID || live?.hasParts) {
-      if (requestedHydration) {
-        requestedHydration = undefined
-        hydrationRequest += 1
-      }
+    if (!sessionID) {
+      hydrationRequest += 1
+      setHydratedChildMessages(undefined)
       return
     }
-    if (requestedHydration?.token === ownership.token && requestedHydration.sessionID === sessionID) return
 
     const request = ++hydrationRequest
-    requestedHydration = { token: ownership.token, sessionID }
-    setHydratedChildMessages(undefined)
     void hydrateChildMessages(ownership.token, sessionID, request)
   })
 
@@ -157,40 +146,48 @@ function TaskPopover(props: {
     if (!sessionID) return undefined
 
     const live = liveChildMessages()
-    if (live?.hasParts) return latestAssistantText(live.messages, (messageID) => live.parts.get(messageID) ?? [])
+    const liveActivity = live
+      ? latestAssistantActivity(live.messages, (messageID) => live.parts.get(messageID) ?? [])
+      : undefined
+    if (liveActivity) return liveActivity
 
     const hydrated = hydratedChildMessages()
     if (!hydrated || hydrated.token !== ownership.token || hydrated.sessionID !== sessionID) return undefined
     const parts = new Map(hydrated.messages.map((message) => [message.info.id, message.parts]))
-    return latestAssistantText(
+    return latestAssistantActivity(
       hydrated.messages.map((message) => message.info),
       (messageID) => parts.get(messageID) ?? [],
     )
   })
-  const responseLabel = () => latestResponse() ?? (childSessionID() ? "Waiting for assistant response" : "Waiting for child session")
-  const openSession = () => {
+  const responseLabel = () => latestResponse() ?? (childSessionID() ? "Waiting for subagent activity" : "Waiting for child session")
+  const stopInside = (event: MouseEvent): void => event.stopPropagation()
+  const openSession = (event: MouseEvent) => {
+    event.stopPropagation()
     const sessionID = childSessionID()
     if (!canOpen() || !sessionID) return
     props.api.route.navigate("session", { sessionID })
     props.close()
   }
+  const closePopover = (event: MouseEvent): void => {
+    event.stopPropagation()
+    props.close()
+  }
 
-  const applyPortalPlacement = (next = placement()): void => {
+  const applyPortalOverlay = (next = viewport()): void => {
     const wrapper = portalWrapper
     if (!wrapper || wrapper.isDestroyed) return
     wrapper.position = "absolute"
-    wrapper.left = next.left
-    wrapper.top = next.top
+    wrapper.left = 0
+    wrapper.top = 0
     wrapper.width = next.width
     wrapper.height = next.height
     wrapper.zIndex = POPOVER_Z_INDEX
     wrapper.focusable = false
   }
-  createEffect(() => applyPortalPlacement(placement()))
+  createEffect(() => applyPortalOverlay(viewport()))
 
   onCleanup(() => {
     hydrationRequest += 1
-    requestedHydration = undefined
     portalWrapper = undefined
   })
 
@@ -199,59 +196,103 @@ function TaskPopover(props: {
       mount={props.api.renderer.root}
       ref={(element) => {
         portalWrapper = element as BoxRenderable
-        applyPortalPlacement()
+        applyPortalOverlay()
       }}
     >
       <box
         width="100%"
         height="100%"
         focusable={false}
-        live
-        border
-        borderColor={props.api.theme.current.borderActive}
-        backgroundColor={props.api.theme.current.backgroundPanel}
-        padding={1}
-        flexDirection="column"
-        overflow="hidden"
+        onMouseUp={props.close}
       >
-        <text fg={props.api.theme.current.text} wrapMode="none" truncate>
-          <b>Subagent details</b>
-        </text>
-        <text fg={props.api.theme.current.text} wrapMode="none" truncate>
-          Agent: {taskAgent(part() ?? fallback().part)}
-        </text>
-        <text fg={props.api.theme.current.textMuted} wrapMode="none" truncate>
-          Assigned: {taskDescription(part() ?? fallback().part)}
-        </text>
-        <text fg={props.api.theme.current.textMuted} wrapMode="none" truncate>
-          Latest: {responseLabel()}
-        </text>
-        <text fg={props.api.theme.current.textMuted} wrapMode="none" truncate>
-          Status: {taskStatusLabel(part() ?? fallback().part, childSessionID() ? props.api.state.session.status(childSessionID()!) : undefined)}
-        </text>
-        <text fg={props.api.theme.current.textMuted} wrapMode="none" truncate>
-          Model: {modelName(props.api, model())} · {taskVariantLabel(model()) ?? "pending"}
-        </text>
-        <text fg={props.api.theme.current.textMuted} wrapMode="none" truncate>
-          {taskModeLabel(part() ?? fallback().part)} · {elapsedLabel(props.now() - props.startedAt(part() ?? fallback().part))}
-        </text>
-        <text fg={props.api.theme.current.textMuted} wrapMode="none" truncate>
-          Child: {childSessionID() ?? "Waiting for child session"}
-        </text>
-        <box flexDirection="row" gap={2}>
-          <box onMouseUp={openSession}>
-            <text fg={canOpen() ? props.api.theme.current.primary : props.api.theme.current.textMuted}>
-              <b>Open Session</b>
-            </text>
-          </box>
-          <box onMouseUp={props.close}>
-            <text fg={props.api.theme.current.primary}>
-              <b>Close</b>
-            </text>
+        <box
+          position="absolute"
+          left={placement().left}
+          top={placement().top}
+          width={placement().width}
+          height={placement().height}
+          focusable={false}
+          live
+          border
+          borderColor={props.api.theme.current.borderActive}
+          backgroundColor={props.api.theme.current.backgroundPanel}
+          padding={1}
+          flexDirection="column"
+          overflow="hidden"
+          onMouseUp={stopInside}
+        >
+          <text fg={props.api.theme.current.text} wrapMode="none" truncate>
+            <b>Subagent details</b>
+          </text>
+          <text fg={props.api.theme.current.text} wrapMode="none" truncate>
+            Agent: {taskAgent(part() ?? fallback().part)}
+          </text>
+          <text fg={props.api.theme.current.textMuted} wrapMode="none" truncate>
+            Assigned: {taskDescription(part() ?? fallback().part)}
+          </text>
+          <text fg={props.api.theme.current.textMuted} wrapMode="none" truncate>
+            Current: {responseLabel()}
+          </text>
+          <text fg={props.api.theme.current.textMuted} wrapMode="none" truncate>
+            Status: {taskStatusLabel(part() ?? fallback().part, childSessionID() ? props.api.state.session.status(childSessionID()!) : undefined)}
+          </text>
+          <text fg={props.api.theme.current.textMuted} wrapMode="none" truncate>
+            Model: {modelName(props.api, model())} · {taskVariantLabel(model()) ?? "pending"}
+          </text>
+          <text fg={props.api.theme.current.textMuted} wrapMode="none" truncate>
+            {taskModeLabel(part() ?? fallback().part)} · {elapsedLabel(props.now() - props.startedAt(part() ?? fallback().part))}
+          </text>
+          <text fg={props.api.theme.current.textMuted} wrapMode="none" truncate>
+            Child: {childSessionID() ?? "Waiting for child session"}
+          </text>
+          <box flexDirection="row" gap={2}>
+            <box onMouseUp={openSession}>
+              <text fg={canOpen() ? props.api.theme.current.primary : props.api.theme.current.textMuted}>
+                <b>Open Session</b>
+              </text>
+            </box>
+            <box onMouseUp={closePopover}>
+              <text fg={props.api.theme.current.primary}>
+                <b>Close</b>
+              </text>
+            </box>
           </box>
         </box>
       </box>
     </Portal>
+  )
+}
+
+function ModelVariant(props: {
+  api: TuiPluginApi
+  model: () => ReturnType<typeof resolvedModel>
+}) {
+  return (
+    <box flexShrink={1} minWidth={0} maxWidth={28} marginLeft={1} flexDirection="row">
+      <text flexGrow={1} flexShrink={1} minWidth={0} wrapMode="none" truncate fg={props.api.theme.current.text}>
+        {modelName(props.api, props.model())}
+      </text>
+      <Show
+        when={taskVariantLabel(props.model())}
+        fallback={
+          <Show when={props.model()}>
+            <text flexShrink={0} marginLeft={1} wrapMode="none" fg={props.api.theme.current.textMuted}>·</text>
+            <text flexShrink={0} marginLeft={1} wrapMode="none" truncate fg={props.api.theme.current.warning}>
+              <b>pending</b>
+            </text>
+          </Show>
+        }
+      >
+        {(variant) => (
+          <>
+            <text flexShrink={0} marginLeft={1} wrapMode="none" fg={props.api.theme.current.textMuted}>·</text>
+            <text flexShrink={0} marginLeft={1} wrapMode="none" truncate fg={props.api.theme.current.warning}>
+              <b>{variant()}</b>
+            </text>
+          </>
+        )}
+      </Show>
+    </box>
   )
 }
 
@@ -339,33 +380,7 @@ function TaskCard(props: {
         <text flexGrow={1} flexShrink={1} minWidth={0} wrapMode="none" truncate fg={props.api.theme.current.text}>
           <b>{part() ? taskAgent(part()!) : "subagent"}</b>
         </text>
-        <box
-          flexShrink={1}
-          minWidth={0}
-          maxWidth={28}
-          marginLeft={1}
-          flexDirection="row"
-        >
-          <text flexGrow={1} flexShrink={1} minWidth={0} wrapMode="none" truncate fg={props.api.theme.current.textMuted}>
-            {modelName(props.api, model())}
-          </text>
-          <Show
-            when={taskVariantLabel(model())}
-            fallback={
-              <Show when={model()}>
-                <text flexShrink={0} marginLeft={1} wrapMode="none" truncate fg={props.api.theme.current.textMuted}>
-                  · pending
-                </text>
-              </Show>
-            }
-          >
-            {(variant) => (
-              <text flexShrink={0} marginLeft={1} wrapMode="none" truncate fg={props.api.theme.current.textMuted}>
-                · {variant()}
-              </text>
-            )}
-          </Show>
-        </box>
+        <ModelVariant api={props.api} model={model} />
       </box>
       <box width="100%" height={1} flexDirection="row" overflow="hidden">
         <text
@@ -566,7 +581,7 @@ function RunningSubagents(props: { api: TuiPluginApi; sessionID: string }) {
   })
 
   return (
-    <box overflow="hidden">
+    <box overflow="hidden" flexDirection="column" gap={1}>
       <text fg={props.api.theme.current.text}>
         <b>Subagents</b>
         <span style={{ fg: props.api.theme.current.textMuted }}>
@@ -578,22 +593,24 @@ function RunningSubagents(props: { api: TuiPluginApi; sessionID: string }) {
         when={taskCallIDs().length > 0}
         fallback={<text fg={props.api.theme.current.textMuted}>No subagent running</text>}
       >
-        <For each={taskCallIDs()}>
-          {(callID) => (
-            <TaskCard
-              api={props.api}
-              callID={callID}
-              tasksByCallID={tasksByCallID}
-              fallbackFor={(id) => fallbacks.get(id)}
-              remember={remember}
-              revision={revision}
-              now={now}
-              startedAt={startedAt}
-              openPopup={showPopup}
-              updatePopupAnchor={updatePopupAnchor}
-            />
-          )}
-        </For>
+        <box width="100%" flexDirection="column" gap={1}>
+          <For each={taskCallIDs()}>
+            {(callID) => (
+              <TaskCard
+                api={props.api}
+                callID={callID}
+                tasksByCallID={tasksByCallID}
+                fallbackFor={(id) => fallbacks.get(id)}
+                remember={remember}
+                revision={revision}
+                now={now}
+                startedAt={startedAt}
+                openPopup={showPopup}
+                updatePopupAnchor={updatePopupAnchor}
+              />
+            )}
+          </For>
+        </box>
       </Show>
       <Show when={openPopup()}>
         {(ownership) => (

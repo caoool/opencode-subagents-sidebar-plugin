@@ -4,7 +4,6 @@ import test from "node:test"
 import {
   canOpenTaskSession,
   isVisibleTask,
-  latestAssistantText,
   resolveTaskModel,
   taskDescription,
   taskModeLabel,
@@ -63,41 +62,6 @@ test("uses a normalized assigned task description before the legacy title", () =
   )
   assert.equal(taskDescription(task({ status: "running", input: {}, title: "## Legacy\ntask" })), "Legacy task")
   assert.equal(taskDescription(task({ status: "pending", input: {}, raw: "" })), "Working")
-})
-
-test("uses the newest visible assistant text response as a collapsed display line", () => {
-  const messages = [
-    { id: "assistant-old", role: "assistant" },
-    { id: "assistant-empty", role: "assistant" },
-    { id: "assistant-new", role: "assistant" },
-    { id: "user-new", role: "user" },
-  ]
-  const parts = new Map([
-    ["assistant-old", [{ type: "text", text: "Old response" }]],
-    [
-      "assistant-empty",
-      [
-        { type: "reasoning", text: "private reasoning" },
-        { type: "text", text: "ignored response", ignored: true },
-        { type: "text", text: " \n " },
-      ],
-    ],
-    [
-      "assistant-new",
-      [
-        { type: "text", text: "\nNewest\tresponse  " },
-        { type: "reasoning", text: "reasoning is not a reply" },
-        { type: "tool", tool: "read" },
-        { type: "text", text: "ignored", ignored: true },
-        { type: "text", text: "continues" },
-      ],
-    ],
-    ["user-new", [{ type: "text", text: "User text must not win" }]],
-  ])
-
-  assert.equal(latestAssistantText(messages, (messageID) => parts.get(messageID) ?? []), "Newest response continues")
-  assert.equal(latestAssistantText(messages.slice(0, 2), (messageID) => parts.get(messageID) ?? []), "Old response")
-  assert.equal(latestAssistantText([{ id: "assistant", role: "assistant" }], () => [{ type: "text", text: "", ignored: true }]), undefined)
 })
 
 test("resolves child model variants before messages and leaves only metadata variants pending", () => {

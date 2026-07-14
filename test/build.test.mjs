@@ -32,36 +32,46 @@ test("build wires cards to a root Portal popover and session navigation without 
   assert.match(tui, /api\.route\.navigate\("session", \{\s*sessionID\s*\}\)/)
   assert.match(tui, /"maxWidth", 28/)
   assert.match(tui, /taskVariantLabel/)
-  assert.match(tui, /· pending/)
   assert.match(tui, /const allTaskParts = createMemo/)
   assert.match(tui, /new Map\(allTaskParts\(\)\.map/)
   assert.match(tui, /const taskCallIDs = createMemo\(\(\) => visibleTaskParts\(\)/)
   assert.match(tui, /const popupSessionID = createMemo/)
   assert.match(tui, /const closePopup =/)
   assert.match(tui, /const showPopup =[\s\S]*?setOpenPopup\(ownership\)/)
-  assert.match(tui, /latestAssistantText/)
+  assert.match(tui, /latestAssistantActivity/)
   assert.match(tui, /hydrateChildMessages/)
   assert.match(tui, /client\.session\.messages/)
   assert.match(tui, /lifecycle\.signal\.aborted/)
   assert.match(tui, /ownsHydration/)
   assert.doesNotMatch(tui, /name\} · \$\{model\.variant\}/)
-  assert.doesNotMatch(tui, /activityForPart|latestActivity|multi_tool_use/)
   assert.doesNotMatch(tui, /state\.status === "pending" \? "…" : "●"/)
 })
 
-test("source positions the Portal wrapper while the bordered child fills it", async () => {
+test("source uses a full-screen click-away overlay with an attached popover", async () => {
   const source = await readFile(new URL("../src/tui.tsx", import.meta.url), "utf8")
 
   assert.match(
     source,
-    /wrapper\.position = "absolute"\s+wrapper\.left = next\.left\s+wrapper\.top = next\.top\s+wrapper\.width = next\.width\s+wrapper\.height = next\.height\s+wrapper\.zIndex = POPOVER_Z_INDEX/,
+    /wrapper\.position = "absolute"\s+wrapper\.left = 0\s+wrapper\.top = 0\s+wrapper\.width = next\.width\s+wrapper\.height = next\.height\s+wrapper\.zIndex = POPOVER_Z_INDEX/,
   )
-  assert.match(source, /createEffect\(\(\) => applyPortalPlacement\(placement\(\)\)\)/)
+  assert.match(source, /createEffect\(\(\) => applyPortalOverlay\(viewport\(\)\)\)/)
   assert.match(source, /<Portal[\s\S]*?ref=\{\(element\) => \{[\s\S]*?portalWrapper = element as BoxRenderable/)
   assert.match(
     source,
-    /<box\s+width="100%"\s+height="100%"\s+focusable=\{false\}\s+live\s+border\s+borderColor=\{props\.api\.theme\.current\.borderActive\}\s+backgroundColor=\{props\.api\.theme\.current\.backgroundPanel\}/,
+    /<box\s+width="100%"\s+height="100%"\s+focusable=\{false\}\s+onMouseUp=\{props\.close\}\s*>/,
   )
+  assert.match(source, /position="absolute"\s+left=\{placement\(\)\.left\}[\s\S]*?onMouseUp=\{stopInside\}/)
+  assert.match(source, /const stopInside = \(event: MouseEvent\): void => event\.stopPropagation\(\)/)
+  assert.match(source, /const closePopover = \(event: MouseEvent\): void => \{\s+event\.stopPropagation\(\)\s+props\.close\(\)/)
+})
+
+test("cards include blank-line spacing and prompt-metadata colors", async () => {
+  const source = await readFile(new URL("../src/tui.tsx", import.meta.url), "utf8")
+
+  assert.match(source, /<box overflow="hidden" flexDirection="column" gap=\{1\}>/)
+  assert.match(source, /<box width="100%" flexDirection="column" gap=\{1\}>\s+<For each=\{taskCallIDs\(\)\}>/)
+  assert.match(source, /function ModelVariant[\s\S]*?fg=\{props\.api\.theme\.current\.text\}/)
+  assert.match(source, /function ModelVariant[\s\S]*?fg=\{props\.api\.theme\.current\.warning\}>\s+<b>\{variant\(\)\}<\/b>/)
 })
 
 test("elapsed rail explicitly combines row direction with right justification", async () => {
@@ -86,15 +96,14 @@ test("card geometry tracking is frame-based, change-only, and preserves the owne
   assert.doesNotMatch(cleanup[0], /updatePopupAnchor|setOpenPopup/)
 })
 
-test("child transcript hydration is ownership-guarded and yields to live state", async () => {
+test("child transcript hydration refreshes live activity while the popover is open", async () => {
   const source = await readFile(new URL("../src/tui.tsx", import.meta.url), "utf8")
 
-  assert.match(source, /<text fg=\{props\.api\.theme\.current\.textMuted\} wrapMode="none" truncate>\s+Latest: \{responseLabel\(\)\}/)
+  assert.match(source, /<text fg=\{props\.api\.theme\.current\.textMuted\} wrapMode="none" truncate>\s+Current: \{responseLabel\(\)\}/)
   assert.match(source, /const ownsHydration = [\s\S]*?lifecycle\.signal\.aborted[\s\S]*?ownership\(\)\.token === token/)
   assert.match(source, /const hydrateChildMessages = async [\s\S]*?client\.session\.messages[\s\S]*?!ownsHydration/)
-  assert.match(
-    source,
-    /const live = liveChildMessages\(\)\s+if \(live\?\.hasParts\) return latestAssistantText[\s\S]*?const hydrated = hydratedChildMessages\(\)/,
-  )
+  assert.match(source, /createEffect\(\(\) => \{\s+props\.revision\(\)\s+props\.now\(\)/)
+  assert.match(source, /const liveActivity = live[\s\S]*?latestAssistantActivity[\s\S]*?if \(liveActivity\) return liveActivity/)
+  assert.doesNotMatch(source, /hasParts|requestedHydration/)
   assert.match(source, /hydrated\.token !== ownership\.token \|\| hydrated\.sessionID !== sessionID/)
 })

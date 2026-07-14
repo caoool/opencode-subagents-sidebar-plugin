@@ -9,8 +9,6 @@ export declare function normalizeTaskDescription(value: unknown): string | undef
 export declare function taskSessionID(part: ToolPart): string | undefined;
 export declare function taskAgent(part: VisibleTaskPart): string;
 export declare function taskDescription(part: VisibleTaskPart): string;
-/** Returns the latest visible assistant response as a single display line. */
-export declare function latestAssistantText(messages: ReadonlyArray<Message>, partsForMessage: (messageID: string) => ReadonlyArray<Part>): string | undefined;
 export declare function resolveTaskModel(part: VisibleTaskPart, childSession: Session | undefined, childMessages: ReadonlyArray<Message>): TaskModel | undefined;
 export declare function taskModelLabel(model: TaskModel | undefined, displayName?: string): string;
 export declare function taskVariantLabel(model: TaskModel | undefined): string | undefined;
